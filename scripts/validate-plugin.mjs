@@ -50,8 +50,16 @@ for (const relativePath of [
   "hooks/session-start.mjs",
   "hooks/configure-runtime.ps1",
   "skills/zcode-bridge/SKILL.md",
+  "scripts/wait-task.mjs",
 ]) {
   await access(path.join(pluginRoot, relativePath));
+}
+
+// The waiter runs straight from the installed plugin (ADR-010), so it may only
+// import Node built-ins.
+const waiter = await readFile(path.join(pluginRoot, "scripts", "wait-task.mjs"), "utf8");
+for (const match of waiter.matchAll(/(?:from|import)\s*\(?\s*["']([^"']+)["']/gu)) {
+  if (!match[1].startsWith("node:")) throw new Error(`scripts/wait-task.mjs must import only node: built-ins (found ${match[1]})`);
 }
 
 // The installed plugin must load without the development checkout: bundles

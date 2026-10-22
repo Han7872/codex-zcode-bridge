@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本仓库把 Codex 的任务派发给本机 ZCode 执行。任何 agent 动手前先读这份文件。
+本仓库把 Codex（或 Claude Code，见 ADR-010）的任务派发给本机 ZCode 执行。任何 agent 动手前先读这份文件。
 
 ## 阅读顺序
 
