@@ -611,6 +611,33 @@ test("continueTask archives prior evidence, passes feedback through, and increme
   }
 });
 
+test("continueTask resumes a cancelled task as a new attempt and keeps the cancelled result as evidence", async () => {
+  const fx = await freshFixture();
+  try {
+    await fx.manager.createTask(fx.makeTask());
+    assert.equal((await fx.manager.cancelTask("task_1")).status, "cancelled");
+
+    const receipt = await fx.manager.continueTask({ task_id: "task_1", feedback: "Resume without asking" });
+    assert.equal(receipt.status, "running", "the cancelled attempt freed the slot");
+    assert.equal(fx.spawned.length, 2);
+    const status = fx.store.readStatus("task_1");
+    assert.equal(status.attempt, 2);
+    assert.equal(status.cancel_requested, null, "the cancel intent must not carry into the new attempt");
+    assert.equal(fx.store.readArchivedResult("task_1", 1)?.status, "cancelled");
+
+    const adapter = new FakeAdapter();
+    await fx.runWorker("task_1", adapter);
+    await fx.manager.recoverTasks();
+    const call = adapter.calls[0]!;
+    assert.equal(call.kind, "continue");
+    assert.equal(call.attempt, 2);
+    assert.equal((call.previousResult as { status?: string } | null)?.status, "cancelled");
+    assert.equal((await fx.manager.getResult("task_1")).status, "completed");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
 test("continueTask is rejected from non-terminal states and for empty feedback", async () => {
   const fx = await freshFixture();
   try {

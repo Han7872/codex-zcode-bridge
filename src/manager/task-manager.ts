@@ -1002,7 +1002,11 @@ export class BridgeTaskManager implements ProgressTaskManager {
           return { task_id: taskId, status: status.status === "running" ? "running" : "queued", created_at: status.created_at };
         }
       }
-      if (!["completed", "failed", "waiting_for_master"].includes(status.status)) {
+      // cancelled is continuable: cancel records it only after the process
+      // tree is verified gone, and interaction records are keyed by the
+      // current attempt, so a request left unanswered by the cancelled
+      // attempt cannot be answered from the next one.
+      if (!["completed", "failed", "cancelled", "waiting_for_master"].includes(status.status)) {
         throw new TaskManagerError(
           "TASK_STATE",
           `zcode_continue is not allowed from status ${status.status}`,

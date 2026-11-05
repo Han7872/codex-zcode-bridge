@@ -258,7 +258,7 @@ export function createBridgeServer(options: BridgeServerOptions): McpServer {
     "zcode_continue",
     {
       title: "Continue a ZCode task with master feedback",
-      description: `Continue a finished task with master feedback: reuses the task ID and workspace, increments the attempt, and preserves prior evidence. Allowed from completed, failed, or waiting_for_master. Supply a stable operation_id when retrying after a lost response; the same ID and input will not create another attempt. A decision flagged by ZCode is never auto-approved; the calling host must provide the follow-up instruction. ${EXECUTION_NOT_VERDICT}`,
+      description: `Continue a finished task with master feedback: reuses the task ID and workspace, increments the attempt, and preserves prior evidence. Allowed from completed, failed, cancelled, or waiting_for_master. Supply a stable operation_id when retrying after a lost response; the same ID and input will not create another attempt. A decision flagged by ZCode is never auto-approved; the calling host must provide the follow-up instruction. ${EXECUTION_NOT_VERDICT}`,
       inputSchema: zcodeContinueInputSchema,
       outputSchema: taskReceiptSchema,
     },
