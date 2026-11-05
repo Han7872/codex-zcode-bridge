@@ -46,8 +46,10 @@ function snapshot(dir: string): string[] {
   });
 }
 
-const requested = (seq: number, id: string, extra: object = {}) => ({ seq, at: "t", type: "interaction_requested", summary: "s", details: { request_id: `1:${id}`, method: "interaction/requestPermission", toolName: "Bash", reason: "High risk", input: { command: `cmd-${seq}` }, ...extra } });
+// The fixture status is attempt 2; the worker prefixes request ids with the attempt.
+const requested = (seq: number, id: string, extra: object = {}, attempt = 2) => ({ seq, at: "t", type: "interaction_requested", summary: "s", details: { request_id: `${attempt}:${id}`, method: "interaction/requestPermission", toolName: "Bash", reason: "High risk", input: { command: `cmd-${seq}` }, ...extra } });
 const replied = (seq: number, id: string) => ({ seq, at: "t", type: "interaction_replied", summary: "s", details: { request_id: id } });
+const submitted = (seq: number, scopedId: string) => ({ seq, at: "t", type: "interaction_reply_submitted", summary: "s", details: { request_id: scopedId } });
 const output = (seq: number, text: string) => ({ seq, at: "t", type: "model_output", summary: text });
 
 test("terminal status returns at once with the cursor and without writing", () => {
@@ -72,7 +74,7 @@ test("reports the earliest unanswered request after the cursor; answered and old
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.json.reason, "interaction");
     assert.equal(result.json.pending.seq, 7);
-    assert.equal(result.json.pending.request_id, "1:perm_a");
+    assert.equal(result.json.pending.request_id, "2:perm_a");
     assert.equal(result.json.pending.tool, "Bash");
     assert.equal(result.json.pending.input, JSON.stringify({ command: "cmd-7" }));
     assert.equal(result.json.pending_count, 2);
@@ -117,7 +119,7 @@ test("notices events appended while waiting, including a split final line", asyn
     assert.equal(await exited, 0);
     const result = JSON.parse(stdout);
     assert.equal(result.reason, "interaction");
-    assert.equal(result.pending.request_id, "1:perm_late");
+    assert.equal(result.pending.request_id, "2:perm_late");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -134,7 +136,7 @@ test("a replaced log generation restarts the scan instead of trusting the old cu
     writeFileSync(path.join(f.taskDir, "events.gen"), "gen-2");
     writeFileSync(path.join(f.taskDir, "events.jsonl"), `${filler}${JSON.stringify(requested(30, "perm_y"))}\n`);
     assert.equal(await exited, 0);
-    assert.equal(JSON.parse(stdout).pending.request_id, "1:perm_y");
+    assert.equal(JSON.parse(stdout).pending.request_id, "2:perm_y");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -168,4 +170,74 @@ test("rejects invalid task ids and unknown options before reading anything", () 
       assert.match(result.stderr, /usage: node wait-task\.mjs/);
     }
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("a request left over from an earlier attempt neither blocks the current attempt nor hides a terminal status", () => {
+  const stale = requested(2, "perm_old", {}, 1);
+  const running = fixture("running", [stale, output(3, "attempt 2 working")]);
+  try {
+    const result = run(["--task", TASK, "--data-dir", running.dataDir, "--timeout-s", "1", "--poll-ms", "250"], running.home);
+    assert.equal(result.status, 3, result.stderr);
+    assert.equal(result.json.reason, "timeout");
+    assert.equal(result.json.pending, null);
+    assert.equal(result.json.pending_count, 0);
+  } finally { rmSync(running.root, { recursive: true, force: true }); }
+
+  const done = fixture("completed", [stale, requested(4, "perm_current_unanswered")]);
+  try {
+    const result = run(["--task", TASK, "--data-dir", done.dataDir, "--timeout-s", "5"], done.home);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.json.reason, "terminal");
+    assert.equal(result.json.status, "completed");
+    assert.equal(result.json.pending, null);
+  } finally { rmSync(done.root, { recursive: true, force: true }); }
+});
+
+test("native request ids that start with digits or contain colons pair with the right request", () => {
+  const f = fixture("running", [
+    requested(1, "15:abc"),
+    replied(2, "15:abc"),
+    requested(3, "7"),
+    submitted(4, "2:7"),
+    requested(5, "abc"),
+    replied(6, "15"),
+  ]);
+  try {
+    const result = run(["--task", TASK, "--data-dir", f.dataDir, "--timeout-s", "5"], f.home);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.json.reason, "interaction");
+    assert.equal(result.json.pending.request_id, "2:abc", "a reply to native id 15 must not settle 2:abc or 2:15:abc");
+    assert.equal(result.json.pending_count, 1);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a native reply settles the current attempt when an earlier attempt reused the same native id", () => {
+  const f = fixture("running", [requested(1, "rpc-1", {}, 1), requested(2, "rpc-1"), replied(3, "rpc-1"), requested(4, "rpc-2")]);
+  try {
+    const result = run(["--task", TASK, "--data-dir", f.dataDir, "--timeout-s", "5"], f.home);
+    assert.equal(result.json.reason, "interaction");
+    assert.equal(result.json.pending.request_id, "2:rpc-2");
+    assert.equal(result.json.pending_count, 1);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a multi-byte character split across two reads is decoded intact", async () => {
+  const f = fixture("running", [output(1, "start")]);
+  try {
+    const child = spawn(process.execPath, [WAITER, "--task", TASK, "--data-dir", f.dataDir, "--after-seq", "1", "--timeout-s", "15", "--poll-ms", "250"], { env: childEnv(f.home), windowsHide: true });
+    let stdout = "";
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+    const exited = new Promise<number | null>((resolve) => child.on("exit", resolve));
+    const bytes = Buffer.from(`${JSON.stringify(output(2, "中文输出"))}\n${JSON.stringify(requested(3, "perm_zh", { reason: "需要确认" }))}\n`, "utf8");
+    const split = bytes.indexOf(Buffer.from("文", "utf8")) + 1; // inside the 3-byte character
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    appendFileSync(path.join(f.taskDir, "events.jsonl"), bytes.subarray(0, split));
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    appendFileSync(path.join(f.taskDir, "events.jsonl"), bytes.subarray(split));
+    assert.equal(await exited, 0);
+    const result = JSON.parse(stdout);
+    assert.equal(result.recent_output, "中文输出");
+    assert.equal(result.pending.reason, "需要确认");
+    assert.ok(!stdout.includes("\uFFFD") && !stdout.includes("\ufffd"));
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

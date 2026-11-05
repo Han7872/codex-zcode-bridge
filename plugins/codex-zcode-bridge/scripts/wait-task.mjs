@@ -7,11 +7,16 @@
 import { closeSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const TERMINAL = new Set(["completed", "failed", "cancelled", "waiting_for_master"]);
-const SETTLED = new Set(["interaction_reply_submitted", "interaction_replied", "interaction_request_undeliverable", "interaction_request_oversized"]);
+// Settlement events written by the Bridge carry the attempt-scoped request id
+// ("<attempt>:<native id>"); interaction_replied comes from the app-server
+// adapter and carries the native id only.
+const SETTLED_SCOPED = new Set(["interaction_reply_submitted", "interaction_request_undeliverable", "interaction_request_oversized"]);
+const SETTLED_NATIVE = "interaction_replied";
 const INPUT_LIMIT = 4_000;
 const OUTPUT_LIMIT = 1_500;
 const SCHEMA = "zcode-bridge/wait-task-v1";
@@ -78,8 +83,32 @@ function readStatus(taskDir) {
   }
 }
 
-function requestKey(requestId) {
-  return typeof requestId === "string" ? requestId.replace(/^\d+:/u, "") : null;
+// Splits only the Bridge-added attempt prefix. The native id is everything
+// after the first "<digits>:" and may itself start with digits or contain
+// colons, so it is never re-parsed.
+export function parseScopedRequestId(requestId) {
+  if (typeof requestId !== "string" || requestId === "") return null;
+  const match = /^(\d+):([\s\S]+)$/u.exec(requestId);
+  if (!match) return { full: requestId, attempt: null, native: requestId };
+  return { full: requestId, attempt: Number(match[1]), native: match[2] };
+}
+
+// interaction_replied names the native id only. Settle the newest matching
+// request so a reused native id from an earlier attempt cannot absorb it.
+function settleNative(pending, nativeId) {
+  if (typeof nativeId !== "string" || nativeId === "") return;
+  let match = null;
+  for (const entry of pending.values()) {
+    if (entry.id.native !== nativeId) continue;
+    if (!match || (entry.id.attempt ?? -1) > (match.id.attempt ?? -1) || ((entry.id.attempt ?? -1) === (match.id.attempt ?? -1) && entry.event.seq > match.event.seq)) match = entry;
+  }
+  if (match) pending.delete(match.id.full);
+}
+
+// A request belongs to the live attempt only when its prefix matches the
+// status attempt; unprefixed ids cannot be attributed and stay visible.
+function isCurrentAttempt(entry, attempt) {
+  return attempt === null || entry.id.attempt === null || entry.id.attempt === attempt;
 }
 
 // Tails events.jsonl from a byte cursor. A shorter file or a new generation
@@ -90,6 +119,7 @@ class EventTail {
     this.genFile = path.join(taskDir, "events.gen");
     this.offset = 0;
     this.partial = "";
+    this.decoder = new StringDecoder("utf8");
     this.generation = null;
   }
 
@@ -102,6 +132,7 @@ class EventTail {
     if ((this.generation !== null && generation !== this.generation) || size < this.offset) {
       this.offset = 0;
       this.partial = "";
+      this.decoder = new StringDecoder("utf8");
       reset = true;
     }
     this.generation = generation;
@@ -117,7 +148,9 @@ class EventTail {
         done += count;
       }
       this.offset += done;
-      const text = this.partial + buffer.subarray(0, done).toString("utf8");
+      // The decoder keeps an incomplete multi-byte sequence for the next read
+      // instead of turning a split character into U+FFFD.
+      const text = this.partial + this.decoder.write(buffer.subarray(0, done));
       const lines = text.split("\n");
       this.partial = lines.pop() ?? "";
       const events = [];
@@ -172,14 +205,26 @@ export async function waitForTask(options, now = () => Date.now(), sleep = (ms) 
       if (typeof event.seq !== "number" || event.seq <= options.afterSeq) continue;
       seen += 1;
       lastSeq = Math.max(lastSeq, event.seq);
-      const key = requestKey(event.details?.request_id);
-      if (event.type === "interaction_requested" && key) pending.set(key, event);
-      else if (SETTLED.has(event.type) && key) pending.delete(key);
-      else if (event.type === "model_output" && typeof event.summary === "string") recent = (recent + event.summary).slice(-OUTPUT_LIMIT * 2);
+      const requestId = event.details?.request_id;
+      if (event.type === "interaction_requested") {
+        const id = parseScopedRequestId(requestId);
+        if (id) pending.set(id.full, { id, event });
+      } else if (SETTLED_SCOPED.has(event.type)) {
+        const id = parseScopedRequestId(requestId);
+        if (id) pending.delete(id.full);
+      } else if (event.type === SETTLED_NATIVE) {
+        settleNative(pending, requestId);
+      } else if (event.type === "model_output" && typeof event.summary === "string") {
+        recent = (recent + event.summary).slice(-OUTPUT_LIMIT * 2);
+      }
     }
-    const first = [...pending.values()].sort((a, b) => a.seq - b.seq)[0];
+    const attempt = Number.isSafeInteger(status?.attempt) ? status.attempt : null;
+    const live = [...pending.values()].filter((entry) => isCurrentAttempt(entry, attempt)).map((entry) => entry.event);
+    const first = live.sort((a, b) => a.seq - b.seq)[0];
     const terminal = status && TERMINAL.has(status.status);
-    const reason = first ? "interaction" : terminal ? "terminal" : now() >= deadline ? "timeout" : null;
+    // A terminal status wins: a request left unanswered by an earlier or
+    // finished attempt cannot be acted on and must not hide the outcome.
+    const reason = terminal ? "terminal" : first ? "interaction" : now() >= deadline ? "timeout" : null;
     if (reason) {
       return {
         schema: SCHEMA,
@@ -190,8 +235,8 @@ export async function waitForTask(options, now = () => Date.now(), sleep = (ms) 
         elapsed_ms: now() - started,
         next_after_seq: lastSeq,
         events_seen: seen,
-        pending: first ? describePending(first) : null,
-        pending_count: pending.size,
+        pending: !terminal && first ? describePending(first) : null,
+        pending_count: terminal ? 0 : live.length,
         recent_output: recent.slice(-OUTPUT_LIMIT),
         note: "Observation only. Decide and act through zcode_events/zcode_interaction_reply; a preview is not the full request, and completed is not acceptance.",
       };
